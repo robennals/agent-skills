@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "robennals-agent-skills",
+  "description": "Skills and plugins for coding agents, by Rob Ennals",
+  "owner": {
+    "name": "Rob Ennals",
+    "url": "https://github.com/robennals"
+  },
+  "plugins": [
+    {
+      "name": "heavy",
+      "source": "./plugins/heavy",
+      "description": "Stop parallel agents from wedging your machine. Serialises expensive commands - tests, builds, E2E, dev servers - behind a machine-wide lock, and blocks unwrapped ones with a PreToolUse hook.",
+      "author": { "name": "Rob Ennals" },
+      "category": "productivity",
+      "keywords": ["throttle", "parallel-agents", "hooks", "tests", "dev-server"],
+      "homepage": "https://github.com/robennals/agent-skills/tree/main/plugins/heavy"
+    }
+  ]
+}
