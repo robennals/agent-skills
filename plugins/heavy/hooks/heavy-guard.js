@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // PreToolUse(Bash) guard: expensive commands must go through `heavy`, so that
 // only one CPU-heavy job and a bounded number of servers run on this machine at
-// a time, no matter how many bb threads are working. See docs/heavy-commands.md.
+// a time, no matter how many agent sessions are working. See skills/heavy/SKILL.md.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -173,7 +173,7 @@ function classify(tokens) {
 function reasonFor(cls, segment) {
   const wrapped = `heavy ${cls} -- ${segment.trim()}`
   const shared = cls === 'run'
-    ? 'CPU-heavy commands run one at a time across every bb thread on this machine'
+    ? 'CPU-heavy commands run one at a time across every agent session on this machine'
     : 'long-lived servers are capped so they cannot eat all the memory'
   return [
     `Blocked: ${shared}, so this has to go through the \`heavy\` wrapper.`,
