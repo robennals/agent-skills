@@ -1,7 +1,7 @@
 {
   "name": "heavy",
   "description": "Serialises expensive commands behind a machine-wide lock, so many agents on one machine cannot all run the test suite at once.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "Rob Ennals" },
   "homepage": "https://github.com/robennals/agent-skills/tree/main/plugins/heavy",
   "license": "MIT"

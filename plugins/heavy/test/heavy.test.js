@@ -223,6 +223,15 @@ test('a malformed --timeout is rejected rather than silently defaulted', async (
   assert.match(result.stderr, /number of seconds/)
 })
 
+test('status survives a reader that closes the pipe early', async () => {
+  // `heavy status | head -2` used to die with an unhandled EPIPE stack trace.
+  const piped = spawn('/bin/sh', ['-c', `"${process.execPath}" "${HEAVY}" status | head -2`],
+    { env: heavyEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  const { code, stderr } = await finished(piped)
+  assert.equal(code, 0)
+  assert.doesNotMatch(stderr, /EPIPE/)
+})
+
 test('every lock is released once the jobs are done', () => {
   const report = status()
   assert.deepEqual(report.run.holders, [])

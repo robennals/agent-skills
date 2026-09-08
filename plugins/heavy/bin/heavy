@@ -20,6 +20,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
+// `heavy status | head -2` closes the pipe while we are still writing. That is
+// the reader's choice, not a failure, and node's default is an unhandled EPIPE
+// with a stack trace.
+process.stdout.on('error', (err) => {
+  if (err.code === 'EPIPE') process.exit(0)
+  throw err
+})
+
 const DIR = process.env.HEAVY_DIR || '/tmp/claude/heavy'
 const CLASSES = {
   run: { capacity: 1, gateOnMemoryPressure: true },
