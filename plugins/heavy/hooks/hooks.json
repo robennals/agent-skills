@@ -1,0 +1,28 @@
+{
+  "description": "heavy — denies expensive Bash commands that are not wrapped, and points at the installer until the wrapper is on PATH",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/heavy-guard.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/setup-notice.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

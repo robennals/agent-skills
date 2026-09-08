@@ -1,0 +1,352 @@
+#!/usr/bin/env node
+// heavy — machine-wide throttle for expensive commands.
+//
+//   heavy run   [--label X] [--timeout SEC] -- <cmd...>   one at a time, machine-wide
+//   heavy serve [--label X] [--slots N]     -- <cmd...>   at most N long-lived servers
+//   heavy status [--json]
+//
+// It waits its turn by default (30 minutes, --timeout SEC to change). Pass
+// --timeout 0 to give up immediately instead when the machine is busy.
+//
+// Anything after `--` is the command. Give it as an argv (`-- npm test`) or, for
+// anything needing shell syntax, as one quoted string (`-- 'cd app && npm test'`).
+//
+// Locks live in $HEAVY_DIR (default /tmp/claude/heavy) as slot files naming the
+// holding pid. A slot whose holder is gone is reclaimed, so a crash or a reboot
+// never wedges the queue. Waiters take FIFO tickets, so no thread starves.
+
+import { spawn, execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+
+const DIR = process.env.HEAVY_DIR || '/tmp/claude/heavy'
+const CLASSES = {
+  run: { capacity: 1, gateOnMemoryPressure: true },
+  serve: { capacity: Number(process.env.HEAVY_SERVE_SLOTS) || 2, gateOnMemoryPressure: false },
+}
+const POLL_MS = 500
+// Probe helpers must stay silent: under a command sandbox `sysctl` is denied, and
+// its complaint would otherwise interleave with the wrapped command's output.
+const QUIET = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+const NAG_MS = 30_000
+
+function usage(code) {
+  process.stderr.write(
+    'usage: heavy run [--label X] [--timeout SEC] -- <command...>\n' +
+    '       heavy serve [--label X] [--slots N] -- <command...>\n' +
+    '       heavy status [--json]\n' +
+    '\n' +
+    "the command may be an argv (-- npm test) or one quoted shell string\n" +
+    "(-- 'cd app && npm test'), which is run through $SHELL\n" +
+    '\n' +
+    'heavy waits its turn by default; --timeout 0 gives up immediately instead\n'
+  )
+  process.exit(code)
+}
+
+// --- process liveness -------------------------------------------------------
+// pid alone is not enough: pids are reused, and a recycled pid would make a
+// dead slot look held forever. The start time pins the identity.
+function psStart(pid) {
+  try {
+    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], QUIET).trim()
+  } catch {
+    return null
+  }
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err.code === 'EPERM' // alive, just not ours to signal
+  }
+}
+
+function isHolderAlive(meta) {
+  if (!pidAlive(meta.pid)) return false
+  const started = psStart(meta.pid)
+  // Where `ps` is unavailable (inside a command sandbox) neither side has a
+  // start time, and pid liveness is the strongest signal available. Failing
+  // open here would be worse: it would quietly disable the lock entirely.
+  if (started === null || !meta.psStart) return true
+  return started === meta.psStart
+}
+
+function removeQuietly(file) {
+  try { fs.unlinkSync(file) } catch {}
+}
+
+function readMeta(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+// A slot with unreadable or dead metadata is garbage; drop it.
+function reapIfDead(file) {
+  const meta = readMeta(file)
+  if (meta && isHolderAlive(meta)) return false
+  removeQuietly(file)
+  return true
+}
+
+// --- memory pressure --------------------------------------------------------
+// 4 == critical, what Activity Monitor shows as red. Starting another heavy job
+// there is how the machine gets wedged hard enough to need a reboot.
+function memoryPressure() {
+  try {
+    return Number(execFileSync('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], QUIET).trim())
+  } catch {
+    return 1
+  }
+}
+
+// --- git branch -------------------------------------------------------------
+// A holder's branch is what turns a full pool into something a human can act
+// on: "both serve slots are taken" is a dead end, "taken by these two branches"
+// tells you whose thread to go and ask.
+function gitBranch(cwd) {
+  if (!cwd) return null
+  try {
+    return execFileSync('git', ['-C', cwd, 'symbolic-ref', '--quiet', '--short', 'HEAD'], QUIET).trim() || null
+  } catch {
+    return null // not a repo, or a detached HEAD with no branch to name
+  }
+}
+
+// --- slots and tickets ------------------------------------------------------
+function classDir(cls) {
+  const d = path.join(DIR, cls)
+  fs.mkdirSync(path.join(d, 'queue'), { recursive: true })
+  return d
+}
+
+function tryTakeSlot(cls, capacity, meta) {
+  const d = classDir(cls)
+  for (let i = 0; i < capacity; i++) {
+    const slot = path.join(d, `slot-${i}.json`)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = fs.openSync(slot, 'wx')
+        fs.writeSync(fd, JSON.stringify(meta))
+        fs.closeSync(fd)
+        return slot
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err
+        if (!reapIfDead(slot)) break // genuinely held; try the next slot
+      }
+    }
+  }
+  return null
+}
+
+function liveTickets(cls) {
+  const qdir = path.join(classDir(cls), 'queue')
+  const live = []
+  for (const name of fs.readdirSync(qdir)) {
+    const file = path.join(qdir, name)
+    if (reapIfDead(file)) continue
+    live.push(name)
+  }
+  // Names are `<epochMs>-<pid>.json`, so lexical order is close but not exact;
+  // sort numerically on the timestamp so FIFO holds across digit-count changes.
+  return live.sort((a, b) => Number(a.split('-')[0]) - Number(b.split('-')[0]))
+}
+
+function describe(meta) {
+  const parts = [meta.label]
+  if (meta.branch) parts.push(`branch ${meta.branch}`)
+  if (meta.thread) parts.push(meta.thread)
+  parts.push(`${Math.round((Date.now() - meta.startedAt) / 1000)}s`)
+  return parts.filter(Boolean).join(', ')
+}
+
+async function acquire(cls, capacity, meta, timeoutMs) {
+  const qdir = path.join(classDir(cls), 'queue')
+  const ticket = path.join(qdir, `${Date.now()}-${meta.pid}.json`)
+  fs.writeFileSync(ticket, JSON.stringify(meta))
+  const ticketName = path.basename(ticket)
+  const deadline = Date.now() + timeoutMs
+  let lastNag = 0
+
+  try {
+    for (;;) {
+      const queue = liveTickets(cls)
+      const ahead = queue.indexOf(ticketName)
+      const gated = CLASSES[cls].gateOnMemoryPressure && memoryPressure() >= 4
+      // FIFO, but only as far as fairness requires: with `capacity` slots the
+      // first `capacity` waiters may all go now. Admitting strictly one at a
+      // time would leave free slots idle for a poll interval each.
+      if (ahead < capacity && !gated) {
+        const slot = tryTakeSlot(cls, capacity, meta)
+        if (slot) return slot
+      }
+      if (Date.now() >= deadline) {
+        const summary = timeoutMs === 0
+          ? `the machine-wide '${cls}' lock is busy`
+          : `timed out after ${Math.round(timeoutMs / 1000)}s waiting for the '${cls}' lock`
+        throw new Error(summary + busyReport(cls, capacity))
+      }
+      if (Date.now() - lastNag > NAG_MS) {
+        lastNag = Date.now()
+        const holders = holdersOf(cls, capacity).map(describe)
+        const reason = gated
+          ? 'memory pressure is critical'
+          : holders.length
+            ? `held by ${holders.join('; ')}`
+            : 'waiting for an earlier job'
+        const position = ahead > 0 ? `, ${ahead} ahead of us` : ''
+        process.stderr.write(`heavy: waiting for the machine-wide '${cls}' lock — ${reason}${position}\n`)
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS))
+    }
+  } finally {
+    removeQuietly(ticket)
+  }
+}
+
+function holdersOf(cls, capacity) {
+  const d = classDir(cls)
+  const out = []
+  for (let i = 0; i < capacity; i++) {
+    const slot = path.join(d, `slot-${i}.json`)
+    if (!fs.existsSync(slot) || reapIfDead(slot)) continue
+    const meta = readMeta(slot)
+    // Read the branch now rather than storing it at claim time: a server that
+    // has been up for hours may have been rebased or switched since, and the
+    // branch it sits on today is the one the human has to go and look at.
+    if (meta) out.push({ ...meta, branch: gitBranch(meta.cwd) })
+  }
+  return out
+}
+
+// Giving up is only useful if the caller learns what to do about it. Name each
+// holder with its branch and directory, so the human can ask that thread to
+// stop the server it no longer needs.
+function busyReport(cls, capacity) {
+  const holders = holdersOf(cls, capacity)
+  if (!holders.length) return ''
+  const lines = holders.map((meta) => `  ${describe(meta)}\n    ${meta.cwd}`)
+  const branches = [...new Set(holders.map((meta) => meta.branch).filter(Boolean))]
+  const ask = branches.length
+    ? `\nask the thread${branches.length > 1 ? 's' : ''} on ${branches.join(' and ')} ` +
+      'to stop, if that work is done'
+    : ''
+  return `\n${holders.length} of ${capacity} '${cls}' slot${capacity === 1 ? '' : 's'} in use:\n` +
+    `${lines.join('\n')}${ask}`
+}
+
+// --- commands ---------------------------------------------------------------
+function parseArgs(argv) {
+  const opts = { label: null, timeout: null, slots: null }
+  const sep = argv.indexOf('--')
+  const flags = sep === -1 ? argv : argv.slice(0, sep)
+  const command = sep === -1 ? [] : argv.slice(sep + 1)
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i]
+    if (flag === '--label') opts.label = flags[++i]
+    else if (flag === '--timeout') opts.timeout = Number(flags[++i])
+    else if (flag === '--slots') opts.slots = Number(flags[++i])
+    else return { error: `unknown option ${flag}` }
+  }
+  return { opts, command }
+}
+
+async function runCommand(cls, argv) {
+  const { error, opts, command } = parseArgs(argv)
+  if (error) { process.stderr.write(`heavy: ${error}\n`); usage(2) }
+  if (!command.length) { process.stderr.write('heavy: no command given (did you forget `--`?)\n'); usage(2) }
+
+  // Leading `KEY=value` tokens are an env prefix, not the binary: the command is
+  // spawned directly rather than through a shell, so peel them off ourselves.
+  const env = { ...process.env }
+  while (command.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[0])) {
+    const assignment = command.shift()
+    const split = assignment.indexOf('=')
+    env[assignment.slice(0, split)] = assignment.slice(split + 1)
+  }
+
+  const capacity = cls === 'serve' && opts.slots ? opts.slots : CLASSES[cls].capacity
+  const configured = opts.timeout ?? (process.env.HEAVY_TIMEOUT === undefined ? null : Number(process.env.HEAVY_TIMEOUT))
+  if (configured !== null && (!Number.isFinite(configured) || configured < 0)) {
+    process.stderr.write('heavy: --timeout takes a number of seconds (0 = give up rather than wait)\n')
+    usage(2)
+  }
+  const timeoutMs = 1000 * (configured ?? 1800)
+  const meta = {
+    pid: process.pid,
+    psStart: psStart(process.pid),
+    label: opts.label || command.join(' ').slice(0, 120),
+    cwd: process.cwd(),
+    thread: process.env.BB_THREAD_ID || null,
+    startedAt: Date.now(),
+    class: cls,
+  }
+
+  let slot
+  try {
+    slot = await acquire(cls, capacity, meta, timeoutMs)
+  } catch (err) {
+    process.stderr.write(`heavy: ${err.message}\n`)
+    process.exit(75) // EX_TEMPFAIL — nothing ran, retrying later is the right move
+  }
+
+  const release = () => removeQuietly(slot)
+  process.on('exit', release)
+
+  // Two call shapes. `heavy run -- npm test` arrives as an argv and is spawned
+  // directly. A single argument — `heavy run -- 'cd app && npm test 2>&1'` — is
+  // shell syntax that the caller's shell never split, so hand it to a shell.
+  const shell = process.env.SHELL || '/bin/sh'
+  const spawnArgs = command.length === 1 ? [shell, ['-c', command[0]]] : [command[0], command.slice(1)]
+
+  // Own process group, so killing heavy takes the whole job with it rather than
+  // orphaning a test runner that keeps burning CPU after the lock is released.
+  const child = spawn(spawnArgs[0], spawnArgs[1], { stdio: 'inherit', detached: true, env })
+  const killGroup = (signal) => { try { process.kill(-child.pid, signal) } catch {} }
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => killGroup(signal))
+
+  const pressureWatch = CLASSES[cls].gateOnMemoryPressure
+    ? setInterval(() => {
+        if (memoryPressure() >= 4) {
+          process.stderr.write('heavy: memory pressure is CRITICAL — consider killing this job\n')
+        }
+      }, NAG_MS)
+    : null
+
+  child.on('error', (err) => {
+    process.stderr.write(`heavy: cannot run ${spawnArgs[0]}: ${err.message}\n`)
+    process.exit(127)
+  })
+  child.on('exit', (code, signal) => {
+    if (pressureWatch) clearInterval(pressureWatch)
+    release()
+    process.exit(signal ? 128 + os.constants.signals[signal] : code)
+  })
+}
+
+function status(argv) {
+  const report = {}
+  for (const [cls, { capacity }] of Object.entries(CLASSES)) {
+    report[cls] = { capacity, holders: holdersOf(cls, capacity), waiting: liveTickets(cls).length }
+  }
+  if (argv.includes('--json')) {
+    process.stdout.write(JSON.stringify(report, null, 2) + '\n')
+    return
+  }
+  for (const [cls, { capacity, holders, waiting }] of Object.entries(report)) {
+    process.stdout.write(`${cls} (${holders.length}/${capacity} in use, ${waiting} waiting)\n`)
+    for (const meta of holders) process.stdout.write(`  ${describe(meta)}\n    ${meta.cwd}\n`)
+  }
+  process.stdout.write(`memory pressure: ${memoryPressure()} (1 normal, 2 warning, 4 critical)\n`)
+}
+
+const [subcommand, ...rest] = process.argv.slice(2)
+if (subcommand === 'run' || subcommand === 'serve') await runCommand(subcommand, rest)
+else if (subcommand === 'status') status(rest)
+else usage(subcommand === '--help' || subcommand === '-h' ? 0 : 2)
