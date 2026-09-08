@@ -1,5 +1,5 @@
 {
-  "description": "heavy — denies expensive Bash commands that are not wrapped, and points at the installer until the wrapper is on PATH",
+  "description": "heavy — denies expensive Bash commands that are not wrapped, and keeps the PATH symlink pointing at the installed version",
   "hooks": {
     "PreToolUse": [
       {
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/setup-notice.sh\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/ensure-path.sh\"",
             "timeout": 10
           }
         ]

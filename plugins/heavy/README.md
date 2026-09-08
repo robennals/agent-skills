@@ -19,10 +19,11 @@ plugin cannot change your PATH. Until it runs, the guard hook stands down and
 nothing is throttled — installing this plugin never blocks a command before you
 have the wrapper that unblocks it.
 
-The symlink points into the installed plugin's version directory, so a plugin
-update leaves it dangling. Nothing breaks quietly when that happens: the guard
-hook stands down, and the session notice tells you to run `/heavy:install`
-again.
+The symlink points into the installed plugin's version directory, which moves
+on every update. A `SessionStart` hook re-points it for you when that happens,
+so you never silently run the previous release. It only ever rewrites a symlink
+that already points into this plugin's cache — your own `heavy` on PATH is
+reported and left alone.
 
 ## Use
 

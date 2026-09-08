@@ -74,6 +74,12 @@ claude plugin uninstall heavy@robennals-agent-skills
 
 `claude plugin list` says which copy won and why.
 
+**Bump `version` in `plugins/heavy/.claude-plugin/plugin.json` for every
+change you want others to get.** `claude plugin update` compares versions, so a
+push that leaves the version alone reports "already at the latest version" and
+installs nothing. `claude plugin tag` creates a matching git tag and checks the
+manifest and marketplace entry agree.
+
 Before pushing:
 
 ```sh
