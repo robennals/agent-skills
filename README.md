@@ -22,19 +22,20 @@ claude plugin install heavy@robennals-agent-skills
 
 **Stops parallel agents from wedging your machine.** If you run several agent
 sessions on one laptop, they will all decide to run the test suite at the same
-moment. `heavy` puts a machine-wide lock in front of expensive commands: one
-CPU-heavy job at a time, at most two long-lived servers, everyone else queues.
+moment. `heavy` runs expensive commands in parallel as far as the machine can take:
+it learns how many fit from CPU, memory and swap, and if the machine gets
+overwhelmed it stops the newest job and backs off.
 
 ```sh
-heavy run   -- npm test        # tests, typecheck, build, E2E, lint: one at a time
-heavy serve -- npm run dev     # dev servers and watchers: at most two at once
-heavy status                   # who holds the locks, who is queued
+heavy run   -- npm test        # tests, typecheck, build, E2E, lint
+heavy serve -- npm run dev     # dev servers and watchers
+heavy status                   # how the machine is doing, what runs, what waits and why
 ```
 
 A `PreToolUse` hook denies any unwrapped expensive Bash command and names the
 wrapped form to use instead, so agents comply without being reminded. When a
-lock is busy, `heavy` names the command, branch, session, and directory holding
-it — so "both server slots are taken" becomes "go ask the session on this
+job has to wait, `heavy` says why and names the command, branch, session, and
+directory of what is running — so "no room" becomes "go ask the session on this
 branch".
 
 One step after installing, because a plugin cannot change your PATH:

@@ -10,7 +10,7 @@
     {
       "name": "heavy",
       "source": "./plugins/heavy",
-      "description": "Stop parallel agents from wedging your machine. Serialises expensive commands - tests, builds, E2E, dev servers - behind a machine-wide lock, and blocks unwrapped ones with a PreToolUse hook.",
+      "description": "Stop parallel agents from wedging your machine. Learns how many expensive commands - tests, builds, E2E, dev servers - the machine can take, stops jobs if it gets overwhelmed, and blocks unwrapped ones with a PreToolUse hook.",
       "author": { "name": "Rob Ennals" },
       "category": "productivity",
       "keywords": ["throttle", "parallel-agents", "hooks", "tests", "dev-server"],

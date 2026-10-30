@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // PreToolUse(Bash) guard: expensive commands must go through `heavy`, so that
-// only one CPU-heavy job and a bounded number of servers run on this machine at
-// a time, no matter how many agent sessions are working. See skills/heavy/SKILL.md.
+// no more jobs run on this machine than it can take, no matter how many agent
+// sessions are working. See skills/heavy/SKILL.md.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -9,7 +9,7 @@ import path from 'node:path'
 const BYPASS = new Set(['0', 'off', 'false'])
 
 // Subcommands and scripts worth serializing. Anything matching SERVER_SCRIPT is
-// long-lived and belongs in the `serve` pool instead of the `run` mutex.
+// long-lived and belongs in the `serve` class instead of `run`.
 const HEAVY_SCRIPT = /^(test|tests|build|dev|start|serve|preview|watch|lint|typecheck|check|e2e|ci|storybook|integration)/
 const SERVER_SCRIPT = /^(dev|start|serve|preview|watch|storybook)/
 const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun'])
@@ -173,7 +173,7 @@ function classify(tokens) {
 function reasonFor(cls, segment) {
   const wrapped = `heavy ${cls} -- ${segment.trim()}`
   const shared = cls === 'run'
-    ? 'CPU-heavy commands run one at a time across every agent session on this machine'
+    ? 'CPU-heavy commands share this machine with every other agent session, up to what it can take'
     : 'long-lived servers are capped so they cannot eat all the memory'
   return [
     `Blocked: ${shared}, so this has to go through the \`heavy\` wrapper.`,
@@ -182,8 +182,8 @@ function reasonFor(cls, segment) {
     '(only this part — keep any surrounding `cd`, pipe, or redirection outside the wrapper.)',
     '',
     cls === 'run'
-      ? 'It queues behind any job already holding the lock, so for anything slow pass run_in_background: true rather than fighting the Bash timeout. `heavy status` shows who holds it.'
-      : 'It takes one of a small number of server slots and holds it until the process exits. If you need several servers at once, run them under a single `heavy serve -- mprocs ...`.',
+      ? 'It may queue until the machine has room, so for anything slow pass run_in_background: true rather than fighting the Bash timeout. `heavy status` shows what is running and why jobs are waiting.'
+      : 'It counts as a running job until the process exits, and may queue if memory is short. If you need several servers at once, run them under a single `heavy serve -- mprocs ...`.',
   ].join('\n')
 }
 

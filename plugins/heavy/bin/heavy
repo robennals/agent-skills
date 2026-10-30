@@ -1,19 +1,26 @@
 #!/usr/bin/env node
 // heavy — machine-wide throttle for expensive commands.
 //
-//   heavy run   [--label X] [--timeout SEC] -- <cmd...>   one at a time, machine-wide
-//   heavy serve [--label X] [--slots N]     -- <cmd...>   at most N long-lived servers
+//   heavy run   [--label X] [--timeout SEC] -- <cmd...>   finite and CPU-heavy
+//   heavy serve [--label X] [--slots N]     -- <cmd...>   long-lived servers
 //   heavy status [--json]
 //
+// How many jobs may run at once is not fixed. heavy keeps a limit and learns it:
+// while the machine stays calm and jobs are queueing the limit goes up, and when
+// the machine is overwhelmed heavy stops the newest job, cuts the limit, and
+// remembers by waiting longer before each later raise. See skills/heavy/SKILL.md.
+//
 // It waits its turn by default (30 minutes, --timeout SEC to change). Pass
-// --timeout 0 to give up immediately instead when the machine is busy.
+// --timeout 0 to give up immediately instead when the machine has no room.
 //
 // Anything after `--` is the command. Give it as an argv (`-- npm test`) or, for
 // anything needing shell syntax, as one quoted string (`-- 'cd app && npm test'`).
 //
-// Locks live in $HEAVY_DIR (default /tmp/claude/heavy) as slot files naming the
-// holding pid. A slot whose holder is gone is reclaimed, so a crash or a reboot
-// never wedges the queue. Waiters take FIFO tickets, so no thread starves.
+// There is no daemon: every wrapper that is waiting or running takes a turn at
+// measuring the machine and updating the shared state in $HEAVY_DIR (default
+// /tmp/claude/heavy). Slot files name the holding pid; a slot whose holder is
+// gone is reclaimed, so a crash or a reboot never wedges the queue. Waiters take
+// FIFO tickets, so no thread starves.
 
 import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -29,13 +36,58 @@ process.stdout.on('error', (err) => {
 })
 
 const DIR = process.env.HEAVY_DIR || '/tmp/claude/heavy'
+const STATE_FILE = path.join(DIR, 'machine.json')
+const LOCK_FILE = path.join(DIR, 'machine.lock')
+const EVENT_LOG = path.join(DIR, 'events.log')
+
+const DEFAULT_CEILING = Math.max(1, Math.floor(os.cpus().length / 2))
+// Ceilings are a backstop that the measured limit normally stays well under.
 const CLASSES = {
-  run: { capacity: 1, gateOnMemoryPressure: true },
-  serve: { capacity: Number(process.env.HEAVY_SERVE_SLOTS) || 2, gateOnMemoryPressure: false },
+  run: { ceiling: Number(process.env.HEAVY_RUN_SLOTS) || DEFAULT_CEILING, constrainedBy: ['memory', 'cpu'] },
+  // Servers sit idle most of the time, so what they compete for is memory.
+  serve: { ceiling: Number(process.env.HEAVY_SERVE_SLOTS) || DEFAULT_CEILING, constrainedBy: ['memory'] },
 }
-const POLL_MS = 500
-// Probe helpers must stay silent: under a command sandbox `sysctl` is denied, and
-// its complaint would otherwise interleave with the wrapped command's output.
+
+// HEAVY_TIME_SCALE shrinks every interval below, so the tests can drive the real
+// control loop in a fraction of a second.
+const TIME_SCALE = Number(process.env.HEAVY_TIME_SCALE) || 1
+const scaled = (milliseconds) => Math.max(1, milliseconds * TIME_SCALE)
+const POLL_MS = Math.max(20, scaled(500))
+const SAMPLE_MS = scaled(3_000)
+const COLD_SAMPLE_MS = scaled(60_000) // rates across a longer gap mean nothing
+// How long a new job gets to show its real load before the next may start.
+const SETTLE_MS = scaled(15_000)
+// Calm time needed per raise of the limit. Doubles with each overload, so a limit
+// that went wrong is not retried straight away.
+const GROW_MS = scaled(30_000)
+const MAX_GROW_MS = scaled(600_000)
+const FORGET_OVERLOADS_MS = scaled(1_800_000)
+// Overload has to last this long to count, so a brief spike kills nothing.
+const MEMORY_OVERLOAD_MS = scaled(6_000)
+const CPU_OVERLOAD_MS = scaled(120_000)
+// One stop at a time, leaving room to see whether it helped.
+const STOP_GAP_MS = scaled(30_000)
+const STOP_GRACE_MS = scaled(5_000)
+const PROBE_TIMEOUT_MS = 5_000
+const INITIAL_LIMIT = 2
+
+// Thresholds. Normal on the 14-core, 48GB machine this was tuned on: CPU 11-45%,
+// memory 51-54% free, swap traffic zero. Free percentage is what the kernel
+// counts as reclaimable, so it stays high when "unused" RAM is nearly gone.
+const CPU_BUSY = 70
+const CPU_OVERLOADED = 98
+const FREE_BUSY = 30
+const FREE_OVERLOADED = 15
+const SWAP_BUSY_MBPS = 20
+const SWAP_OVERLOADED_MBPS = 150
+const PRESSURE_WARNING = 2
+const PRESSURE_CRITICAL = 4
+
+const STOPPED_EXIT_CODE = 76 // heavy stopped the job; distinct from 75, nothing ran
+
+// Probe helpers must stay silent: under a command sandbox `sysctl` and `ps` are
+// denied, and their complaint would otherwise interleave with the wrapped
+// command's output.
 const QUIET = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
 const NAG_MS = 30_000
 
@@ -48,7 +100,9 @@ function usage(code) {
     "the command may be an argv (-- npm test) or one quoted shell string\n" +
     "(-- 'cd app && npm test'), which is run through $SHELL\n" +
     '\n' +
-    'heavy waits its turn by default; --timeout 0 gives up immediately instead\n'
+    'heavy waits its turn by default; --timeout 0 gives up immediately instead\n' +
+    `exit 75: nothing ran, the machine had no room. exit ${STOPPED_EXIT_CODE}: heavy stopped the job\n` +
+    'because the machine was overloaded, so re-run it\n'
   )
   process.exit(code)
 }
@@ -103,15 +157,246 @@ function reapIfDead(file) {
   return true
 }
 
-// --- memory pressure --------------------------------------------------------
-// 4 == critical, what Activity Monitor shows as red. Starting another heavy job
-// there is how the machine gets wedged hard enough to need a reboot.
-function memoryPressure() {
-  try {
-    return Number(execFileSync('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], QUIET).trim())
-  } catch {
-    return 1
+// --- measuring the machine ---------------------------------------------------
+// Everything here has to work inside a command sandbox, which is where most jobs
+// run: sysctl, ps, top and iostat are denied there, but vm_stat, memory_pressure
+// and node's CPU counters are not. The sysctl pressure level is the one thing a
+// sandbox cannot see, so it is a bonus when present and never relied on.
+function cpuTicks() {
+  let busy = 0
+  let idle = 0
+  for (const { times } of os.cpus()) {
+    busy += times.user + times.nice + times.sys + times.irq
+    idle += times.idle
   }
+  return { busy, idle }
+}
+
+function readCounters() {
+  let stalled = false
+  const started = Date.now()
+  const output = (command, args) => {
+    try {
+      return execFileSync(command, args, { ...QUIET, timeout: PROBE_TIMEOUT_MS })
+    } catch (err) {
+      if (err.code === 'ETIMEDOUT') stalled = true
+      return null
+    }
+  }
+  const vmStat = output('vm_stat', [])
+  const freeReport = output('memory_pressure', ['-Q'])
+  const pressure = output('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'])
+  const pageSize = Number(vmStat?.match(/page size of (\d+)/)?.[1])
+  const pages = (name) => Number(vmStat?.match(new RegExp(`${name}:\\s+(\\d+)`))?.[1])
+  return {
+    at: Date.now(),
+    ticks: cpuTicks(),
+    swappedMB: (pages('Swapins') + pages('Swapouts')) * pageSize / 1024 / 1024,
+    freePct: Number(freeReport?.match(/percentage: (\d+)/)?.[1]),
+    pressure: pressure === null ? null : Number(pressure),
+    // A probe this slow means the machine itself is struggling to run anything.
+    stalled: stalled || Date.now() - started >= PROBE_TIMEOUT_MS,
+  }
+}
+
+function toReading(before, after) {
+  const busy = after.ticks.busy - before.ticks.busy
+  const idle = after.ticks.idle - before.ticks.idle
+  const seconds = (after.at - before.at) / 1000
+  const swapMBps = (after.swappedMB - before.swappedMB) / seconds
+  return {
+    cpu: busy + idle > 0 ? Math.round(100 * busy / (busy + idle)) : null,
+    freePct: Number.isFinite(after.freePct) ? after.freePct : null,
+    swapMBps: Number.isFinite(swapMBps) ? Math.round(swapMBps) : null,
+    pressure: after.pressure,
+    stalled: after.stalled,
+  }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+}
+
+// Sorts a reading into what it rules out. Each list holds plain-English reasons.
+function assess({ cpu, freePct, swapMBps, pressure, stalled }) {
+  const memoryOverloaded = []
+  const memoryBusy = []
+  const cpuOverloaded = []
+  const cpuBusy = []
+  if (pressure >= PRESSURE_CRITICAL) memoryOverloaded.push('memory pressure is critical')
+  else if (pressure >= PRESSURE_WARNING) memoryBusy.push('memory pressure is at warning')
+  if (freePct !== null && freePct <= FREE_OVERLOADED) memoryOverloaded.push(`only ${freePct}% of memory is free`)
+  else if (freePct !== null && freePct <= FREE_BUSY) memoryBusy.push(`only ${freePct}% of memory is free`)
+  if (swapMBps >= SWAP_OVERLOADED_MBPS) memoryOverloaded.push(`swapping at ${swapMBps}MB/s`)
+  else if (swapMBps >= SWAP_BUSY_MBPS) memoryBusy.push(`swapping at ${swapMBps}MB/s`)
+  if (stalled) memoryOverloaded.push('the machine took over 5s to answer a simple query')
+  if (cpu >= CPU_OVERLOADED) cpuOverloaded.push(`CPU is ${cpu}% busy`)
+  if (cpu >= CPU_BUSY) cpuBusy.push(`CPU is ${cpu}% busy`)
+  return { memoryOverloaded, memoryBusy, cpuOverloaded, cpuBusy }
+}
+
+// --- learning the limit -----------------------------------------------------
+function initialState() {
+  return {
+    at: 0,
+    limit: INITIAL_LIMIT,
+    growMs: GROW_MS,
+    raisedAt: 0,
+    overloadAt: 0,
+    memoryOverloadSince: null,
+    cpuOverloadSince: null,
+    stop: null,
+    reading: null,
+    counters: null,
+    verdict: 'unknown',
+    reasons: [],
+    lastEvent: null,
+  }
+}
+
+function loadState() {
+  return { ...initialState(), ...readMeta(STATE_FILE) }
+}
+
+function saveState(state) {
+  const temporary = `${STATE_FILE}.${process.pid}`
+  fs.writeFileSync(temporary, JSON.stringify(state))
+  fs.renameSync(temporary, STATE_FILE) // readers never see a half-written file
+}
+
+function recordEvent(state, message) {
+  state.lastEvent = { at: state.at, message }
+  try { fs.appendFileSync(EVENT_LOG, `${new Date(state.at).toISOString()} ${message}\n`) } catch {}
+}
+
+// Servers are stopped last: a test run can simply be re-run, while a dev server
+// may be one that a person, or a running E2E suite, is using.
+function chooseJobToStop(jobs) {
+  const newestFirst = [...jobs].sort((a, b) => (b.admittedAt ?? 0) - (a.admittedAt ?? 0))
+  return newestFirst.find((job) => job.class === 'run') ?? newestFirst[0]
+}
+
+function decide(previous, reading, counters, jobs, waiting, now) {
+  const { memoryOverloaded, memoryBusy, cpuOverloaded, cpuBusy } = assess(reading)
+  // CPU saturation only slows things down, and heavy never holds back the one job
+  // left, so it counts only when stopping a job could actually make room.
+  const cpuHot = cpuOverloaded.length > 0 && jobs.length >= 2
+  // After a gap with no measurements, an old streak says nothing about the present.
+  const continuing = now - previous.at < COLD_SAMPLE_MS
+  const next = {
+    ...previous,
+    at: now,
+    reading,
+    counters,
+    memoryOverloadSince: memoryOverloaded.length ? (continuing && previous.memoryOverloadSince) || now : null,
+    cpuOverloadSince: cpuHot ? (continuing && previous.cpuOverloadSince) || now : null,
+  }
+  const memoryLasted = next.memoryOverloadSince !== null && now - next.memoryOverloadSince >= MEMORY_OVERLOAD_MS
+  const cpuLasted = next.cpuOverloadSince !== null && now - next.cpuOverloadSince >= CPU_OVERLOAD_MS
+  const overloadReasons = [...(memoryLasted ? memoryOverloaded : []), ...(cpuLasted ? cpuOverloaded : [])]
+  const busyReasons = [...memoryOverloaded, ...memoryBusy, ...cpuBusy]
+
+  next.verdict = overloadReasons.length ? 'overloaded' : busyReasons.length ? 'busy' : 'calm'
+  next.reasons = overloadReasons.length ? overloadReasons : busyReasons
+
+  if (previous.overloadAt && now - previous.overloadAt >= FORGET_OVERLOADS_MS) next.growMs = GROW_MS
+
+  if (next.verdict === 'overloaded') {
+    if (jobs.length && now - previous.overloadAt >= STOP_GAP_MS) {
+      const job = chooseJobToStop(jobs)
+      const reason = overloadReasons.join(', ')
+      next.stop = { pid: job.pid, at: now, reason }
+      next.limit = Math.max(1, Math.floor(Math.min(previous.limit, jobs.length) / 2))
+      next.growMs = Math.min(previous.growMs * 2, MAX_GROW_MS)
+      next.overloadAt = now
+      recordEvent(next, `stopped "${job.label}" (${reason}); limit ${previous.limit} -> ${next.limit}, ` +
+        `next raise needs ${Math.round(next.growMs / 1000)}s calm`)
+    }
+    return next
+  }
+
+  // Raise only while the limit is what is holding jobs back. A quiet machine says
+  // nothing about whether more jobs would fit, so it earns nothing.
+  const calmSince = Math.max(previous.raisedAt, previous.overloadAt, newestAdmission(jobs))
+  const measurable = reading.freePct !== null
+  if (next.verdict === 'calm' && measurable && waiting > 0 && jobs.length >= previous.limit &&
+      now - calmSince >= previous.growMs) {
+    next.limit = Math.max(previous.limit, jobs.length) + 1
+    next.raisedAt = now
+    recordEvent(next, `limit ${previous.limit} -> ${next.limit} (${jobs.length} running, ${waiting} waiting, calm)`)
+  }
+  return next
+}
+
+function newestAdmission(jobs) {
+  return jobs.reduce((newest, job) => Math.max(newest, job.admittedAt ?? 0), 0)
+}
+
+// A plain lock, so two wrappers cannot both read the state and one undo the
+// other's lowered limit. A holder that died leaves a stale file, cleared by age.
+function withStateLock(work) {
+  try {
+    fs.closeSync(fs.openSync(LOCK_FILE, 'wx'))
+  } catch {
+    try {
+      if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > 3 * PROBE_TIMEOUT_MS) removeQuietly(LOCK_FILE)
+    } catch {}
+    return null
+  }
+  try {
+    return work()
+  } finally {
+    removeQuietly(LOCK_FILE)
+  }
+}
+
+// Called by every waiter and every running job; whoever finds the measurement out
+// of date refreshes it for the rest. Nothing runs at all when no job does.
+function refreshedState() {
+  fs.mkdirSync(DIR, { recursive: true })
+  const state = loadState()
+  if (Date.now() - state.at < SAMPLE_MS) return state
+  return withStateLock(() => {
+    const previous = loadState()
+    const readingsFile = process.env.HEAVY_READINGS
+    let reading
+    let counters
+    if (readingsFile) {
+      reading = JSON.parse(fs.readFileSync(readingsFile, 'utf8'))
+    } else {
+      const cold = Date.now() - previous.at >= COLD_SAMPLE_MS || !previous.counters
+      let before = previous.counters
+      if (cold) {
+        before = readCounters()
+        sleepSync(500)
+      }
+      counters = readCounters()
+      reading = toReading(before, counters)
+    }
+    const waiting = Object.keys(CLASSES).reduce((sum, cls) => sum + liveTickets(cls).length, 0)
+    const next = decide(previous, reading, counters, allJobs(), waiting, Date.now())
+    saveState(next)
+    return next
+  }) ?? state
+}
+
+// Why the job at the head of the queue may not start yet, or null if it may.
+function refusal(cls, ceiling, state) {
+  const inClass = holdersOf(cls)
+  const everyone = allJobs()
+  if (!state.reading) return 'measuring the machine'
+  if (state.verdict === 'overloaded') return `the machine is overloaded: ${state.reasons.join(', ')}`
+  if (inClass.length >= ceiling) return `${inClass.length} of ${ceiling} '${cls}' slots are in use`
+  // Always let one job of each kind through, or something else eating the machine
+  // would stop all work, and idle servers could block every test run.
+  if (!inClass.length) return null
+  if (state.reading.freePct === null) return "memory can't be read here, so running one at a time"
+  if (everyone.length >= state.limit) return `at the current limit of ${state.limit} job${state.limit === 1 ? '' : 's'}`
+  const { memoryOverloaded, memoryBusy, cpuBusy } = assess(state.reading)
+  const reasons = [...memoryOverloaded, ...memoryBusy, ...(CLASSES[cls].constrainedBy.includes('cpu') ? cpuBusy : [])]
+  if (reasons.length) return reasons.join(', ')
+  if (Date.now() - newestAdmission(everyone) < SETTLE_MS) return 'letting the last job show its real load'
+  return null
 }
 
 // --- git branch -------------------------------------------------------------
@@ -134,14 +419,14 @@ function classDir(cls) {
   return d
 }
 
-function tryTakeSlot(cls, capacity, meta) {
+function tryTakeSlot(cls, ceiling, meta) {
   const d = classDir(cls)
-  for (let i = 0; i < capacity; i++) {
+  for (let i = 0; i < ceiling; i++) {
     const slot = path.join(d, `slot-${i}.json`)
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const fd = fs.openSync(slot, 'wx')
-        fs.writeSync(fd, JSON.stringify(meta))
+        fs.writeSync(fd, JSON.stringify({ ...meta, admittedAt: Date.now() }))
         fs.closeSync(fd)
         return slot
       } catch (err) {
@@ -170,11 +455,11 @@ function describe(meta) {
   const parts = [meta.label]
   if (meta.branch) parts.push(`branch ${meta.branch}`)
   if (meta.thread) parts.push(meta.thread)
-  parts.push(`${Math.round((Date.now() - meta.startedAt) / 1000)}s`)
+  parts.push(`${Math.round((Date.now() - (meta.admittedAt ?? meta.startedAt)) / 1000)}s`)
   return parts.filter(Boolean).join(', ')
 }
 
-async function acquire(cls, capacity, meta, timeoutMs) {
+async function acquire(cls, ceiling, meta, timeoutMs) {
   const qdir = path.join(classDir(cls), 'queue')
   const ticket = path.join(qdir, `${Date.now()}-${meta.pid}.json`)
   fs.writeFileSync(ticket, JSON.stringify(meta))
@@ -184,32 +469,26 @@ async function acquire(cls, capacity, meta, timeoutMs) {
 
   try {
     for (;;) {
-      const queue = liveTickets(cls)
-      const ahead = queue.indexOf(ticketName)
-      const gated = CLASSES[cls].gateOnMemoryPressure && memoryPressure() >= 4
-      // FIFO, but only as far as fairness requires: with `capacity` slots the
-      // first `capacity` waiters may all go now. Admitting strictly one at a
-      // time would leave free slots idle for a poll interval each.
-      if (ahead < capacity && !gated) {
-        const slot = tryTakeSlot(cls, capacity, meta)
+      const state = refreshedState()
+      const ahead = liveTickets(cls).indexOf(ticketName)
+      const reason = ahead > 0
+        ? `${ahead} ahead of us`
+        : refusal(cls, ceiling, state)
+      if (!reason) {
+        const slot = tryTakeSlot(cls, ceiling, meta)
         if (slot) return slot
       }
       if (Date.now() >= deadline) {
         const summary = timeoutMs === 0
-          ? `the machine-wide '${cls}' lock is busy`
-          : `timed out after ${Math.round(timeoutMs / 1000)}s waiting for the '${cls}' lock`
-        throw new Error(summary + busyReport(cls, capacity))
+          ? `no room to start this '${cls}' job: ${reason ?? 'its slot was just taken'}`
+          : `timed out after ${Math.round(timeoutMs / 1000)}s waiting to start this '${cls}' job: ${reason}`
+        throw new Error(summary + busyReport(cls))
       }
       if (Date.now() - lastNag > NAG_MS) {
         lastNag = Date.now()
-        const holders = holdersOf(cls, capacity).map(describe)
-        const reason = gated
-          ? 'memory pressure is critical'
-          : holders.length
-            ? `held by ${holders.join('; ')}`
-            : 'waiting for an earlier job'
-        const position = ahead > 0 ? `, ${ahead} ahead of us` : ''
-        process.stderr.write(`heavy: waiting for the machine-wide '${cls}' lock — ${reason}${position}\n`)
+        const holders = holdersOf(cls).map(describe)
+        const running = holders.length ? `; running: ${holders.join('; ')}` : ''
+        process.stderr.write(`heavy: waiting to start — ${reason ?? 'a slot was just taken'}${running}\n`)
       }
       await new Promise((r) => setTimeout(r, POLL_MS))
     }
@@ -218,12 +497,13 @@ async function acquire(cls, capacity, meta, timeoutMs) {
   }
 }
 
-function holdersOf(cls, capacity) {
+function holdersOf(cls) {
   const d = classDir(cls)
   const out = []
-  for (let i = 0; i < capacity; i++) {
-    const slot = path.join(d, `slot-${i}.json`)
-    if (!fs.existsSync(slot) || reapIfDead(slot)) continue
+  for (const name of fs.readdirSync(d)) {
+    if (!/^slot-\d+\.json$/.test(name)) continue
+    const slot = path.join(d, name)
+    if (reapIfDead(slot)) continue
     const meta = readMeta(slot)
     // Read the branch now rather than storing it at claim time: a server that
     // has been up for hours may have been rebased or switched since, and the
@@ -233,11 +513,15 @@ function holdersOf(cls, capacity) {
   return out
 }
 
+function allJobs() {
+  return Object.keys(CLASSES).flatMap(holdersOf)
+}
+
 // Giving up is only useful if the caller learns what to do about it. Name each
 // holder with its branch and directory, so the human can ask that thread to
 // stop the server it no longer needs.
-function busyReport(cls, capacity) {
-  const holders = holdersOf(cls, capacity)
+function busyReport(cls) {
+  const holders = holdersOf(cls)
   if (!holders.length) return ''
   const lines = holders.map((meta) => `  ${describe(meta)}\n    ${meta.cwd}`)
   const branches = [...new Set(holders.map((meta) => meta.branch).filter(Boolean))]
@@ -245,7 +529,7 @@ function busyReport(cls, capacity) {
     ? `\nask the thread${branches.length > 1 ? 's' : ''} on ${branches.join(' and ')} ` +
       'to stop, if that work is done'
     : ''
-  return `\n${holders.length} of ${capacity} '${cls}' slot${capacity === 1 ? '' : 's'} in use:\n` +
+  return `\n${holders.length} '${cls}' job${holders.length === 1 ? '' : 's'} running:\n` +
     `${lines.join('\n')}${ask}`
 }
 
@@ -279,7 +563,7 @@ async function runCommand(cls, argv) {
     env[assignment.slice(0, split)] = assignment.slice(split + 1)
   }
 
-  const capacity = cls === 'serve' && opts.slots ? opts.slots : CLASSES[cls].capacity
+  const ceiling = cls === 'serve' && opts.slots ? opts.slots : CLASSES[cls].ceiling
   const configured = opts.timeout ?? (process.env.HEAVY_TIMEOUT === undefined ? null : Number(process.env.HEAVY_TIMEOUT))
   if (configured !== null && (!Number.isFinite(configured) || configured < 0)) {
     process.stderr.write('heavy: --timeout takes a number of seconds (0 = give up rather than wait)\n')
@@ -298,7 +582,7 @@ async function runCommand(cls, argv) {
 
   let slot
   try {
-    slot = await acquire(cls, capacity, meta, timeoutMs)
+    slot = await acquire(cls, ceiling, meta, timeoutMs)
   } catch (err) {
     process.stderr.write(`heavy: ${err.message}\n`)
     process.exit(75) // EX_TEMPFAIL — nothing ran, retrying later is the right move
@@ -319,39 +603,70 @@ async function runCommand(cls, argv) {
   const killGroup = (signal) => { try { process.kill(-child.pid, signal) } catch {} }
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => killGroup(signal))
 
-  const pressureWatch = CLASSES[cls].gateOnMemoryPressure
-    ? setInterval(() => {
-        if (memoryPressure() >= 4) {
-          process.stderr.write('heavy: memory pressure is CRITICAL — consider killing this job\n')
-        }
-      }, NAG_MS)
-    : null
+  let stopReason = null
+  const stopForOverload = (reason) => {
+    stopReason = reason
+    process.stderr.write(`heavy: stopping this job because the machine is overloaded (${reason}). ` +
+      'Nothing is wrong with the job; re-run it and heavy will start it when there is room.\n')
+    killGroup('SIGTERM')
+    setTimeout(() => killGroup('SIGKILL'), STOP_GRACE_MS)
+  }
+  // Each wrapper stops its own job. Under a sandbox it could not signal anyone
+  // else's, and this way no process needs more access than the job already has.
+  const machineWatch = setInterval(() => {
+    const { stop } = refreshedState()
+    // The time check is for pids being reused: an old order is not meant for us.
+    if (!stopReason && stop?.pid === process.pid && stop.at >= meta.startedAt) stopForOverload(stop.reason)
+  }, SAMPLE_MS)
 
   child.on('error', (err) => {
     process.stderr.write(`heavy: cannot run ${spawnArgs[0]}: ${err.message}\n`)
     process.exit(127)
   })
   child.on('exit', (code, signal) => {
-    if (pressureWatch) clearInterval(pressureWatch)
+    clearInterval(machineWatch)
     release()
+    if (stopReason) {
+      killGroup('SIGKILL') // anything the job left behind in its process group
+      process.exit(STOPPED_EXIT_CODE)
+    }
     process.exit(signal ? 128 + os.constants.signals[signal] : code)
   })
 }
 
+function describeReading(state) {
+  if (!state.reading) return 'not measured yet'
+  const { cpu, freePct, swapMBps, pressure } = state.reading
+  const parts = [`CPU ${cpu ?? '?'}%`, `memory ${freePct ?? '?'}% free`, `swap ${swapMBps ?? '?'}MB/s`]
+  if (pressure !== null) parts.push(`pressure level ${pressure}`)
+  return parts.join(', ')
+}
+
 function status(argv) {
+  const state = refreshedState()
   const report = {}
-  for (const [cls, { capacity }] of Object.entries(CLASSES)) {
-    report[cls] = { capacity, holders: holdersOf(cls, capacity), waiting: liveTickets(cls).length }
+  for (const [cls, { ceiling }] of Object.entries(CLASSES)) {
+    report[cls] = { ceiling, holders: holdersOf(cls), waiting: liveTickets(cls).length }
   }
+  const { counters, ...machine } = state
+  report.machine = machine
   if (argv.includes('--json')) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n')
     return
   }
-  for (const [cls, { capacity, holders, waiting }] of Object.entries(report)) {
-    process.stdout.write(`${cls} (${holders.length}/${capacity} in use, ${waiting} waiting)\n`)
+  const why = state.reasons.length ? ` (${state.reasons.join(', ')})` : ''
+  process.stdout.write(`machine: ${state.verdict}${why} — ${describeReading(state)}\n`)
+  process.stdout.write(`limit: ${state.limit} job${state.limit === 1 ? '' : 's'} at once, learned from load; ` +
+    `next raise needs ${Math.round(state.growMs / 1000)}s calm with jobs waiting\n`)
+  if (state.lastEvent) {
+    const ago = Math.round((Date.now() - state.lastEvent.at) / 1000)
+    process.stdout.write(`last change: ${state.lastEvent.message}, ${ago}s ago\n`)
+  }
+  for (const cls of Object.keys(CLASSES)) {
+    const { holders, waiting } = report[cls]
+    process.stdout.write(`${cls} (${holders.length} running, ${waiting} waiting)\n`)
     for (const meta of holders) process.stdout.write(`  ${describe(meta)}\n    ${meta.cwd}\n`)
   }
-  process.stdout.write(`memory pressure: ${memoryPressure()} (1 normal, 2 warning, 4 critical)\n`)
 }
 
 const [subcommand, ...rest] = process.argv.slice(2)

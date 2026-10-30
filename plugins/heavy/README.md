@@ -1,10 +1,12 @@
 # heavy
 
-A machine-wide throttle for expensive commands, for people running several
-coding agents on one machine.
+A machine-wide governor for expensive commands, for people running several coding
+agents on one machine.
 
 Without it, parallel sessions all start the test suite at once and the machine
-hangs hard enough to need a reboot. `heavy` serialises the expensive parts.
+hangs hard enough to need a reboot. `heavy` runs as many jobs at once as the
+machine can actually take: it learns that number from CPU, memory and swap, and
+stops jobs if the machine gets overwhelmed.
 
 ## Install
 
@@ -28,17 +30,20 @@ reported and left alone.
 ## Use
 
 ```sh
-heavy run   -- npm test          # finite and CPU-heavy: one at a time, machine-wide
-heavy serve -- npm run dev       # long-lived: at most two at once
-heavy status                     # who holds the locks, who is queued
+heavy run   -- npm test          # finite and CPU-heavy
+heavy serve -- npm run dev       # long-lived
+heavy status                     # how the machine is doing, what runs, what waits and why
 ```
 
-- **`run` is a mutex of one.** Jobs wait in a FIFO queue.
-- **`serve` is a pool of two.** Slots are held until the process exits, so
-  servers can't accumulate, but they never block anyone's tests.
-- **It waits by default**, 30 minutes. `--timeout 0` gives up immediately
-  instead and exits 75, so a caller can tell "machine was busy" from "command
-  failed".
+- **The limit is learned.** While the machine stays calm and jobs are queueing,
+  more may run at once.
+- **Overload is handled for you.** If the machine is overwhelmed, `heavy` stops the
+  newest job, cuts the limit, and waits longer before each later raise. The job
+  exits 76 and is safe to re-run.
+- **There is nothing to tune or run in the background.** It needs no daemon, and it
+  works inside a command sandbox, where most agent commands run.
+- **It waits by default**, 30 minutes. `--timeout 0` gives up immediately instead
+  and exits 75, so a caller can tell "machine was busy" from "command failed".
 
 Pass the command as an argv (`-- npm test`) or, when it needs shell syntax, as
 one quoted string (`-- 'cd app && npm test | tail'`).
@@ -65,8 +70,8 @@ command it is.
 
 ## Notes
 
-Developed and tested on macOS. The lock itself is portable; the memory-pressure
-wait relies on a macOS `sysctl` and goes inert elsewhere.
+Developed and tested on macOS. Where memory can't be read, such as on Linux,
+`heavy` falls back to one job of each kind at a time.
 
 The guard hook only covers Claude Code. Agents on other harnesses get no
 enforcement, so state the rule in your `AGENTS.md` too if you run those.
