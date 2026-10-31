@@ -5,6 +5,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const BYPASS = new Set(['0', 'off', 'false'])
 
@@ -52,16 +53,9 @@ function readStdin() {
   }
 }
 
-function heavyOnPath() {
-  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue
-    try {
-      fs.accessSync(path.join(dir, 'heavy'), fs.constants.X_OK)
-      return true
-    } catch {}
-  }
-  return false
-}
+// Claude Code puts the plugin's bin/ on the Bash tool's PATH but not the hook's, so
+// the guard can't look on PATH for the wrapper. It ships beside this file instead.
+const WRAPPER = fileURLToPath(new URL('../bin/heavy', import.meta.url))
 
 // A heredoc body is data, not commands: `cat > f <<'EOF' ... npm test ... EOF`
 // writes a file, and reading its contents as invocations is a false positive.
@@ -180,6 +174,7 @@ function reasonFor(cls, segment) {
     '',
     `Wrap that part of the command:  ${wrapped}`,
     '(only this part — keep any surrounding `cd`, pipe, or redirection outside the wrapper.)',
+    `If \`heavy\` is not found, use its full path: ${WRAPPER}`,
     '',
     cls === 'run'
       ? 'It may queue until the machine has room, so for anything slow pass run_in_background: true rather than fighting the Bash timeout. `heavy status` shows what is running and why jobs are waiting.'
@@ -190,8 +185,6 @@ function reasonFor(cls, segment) {
 const input = readStdin()
 if (!input || input.tool_name !== 'Bash') allow()
 if (BYPASS.has(String(process.env.HEAVY_GUARD || '').toLowerCase())) allow()
-// Never wedge a machine that has no wrapper installed.
-if (!heavyOnPath()) allow()
 
 const command = input.tool_input?.command
 if (typeof command !== 'string') allow()

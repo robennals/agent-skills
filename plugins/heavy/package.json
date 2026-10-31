@@ -1,0 +1,33 @@
+{
+  "name": "@robennals/heavy",
+  "version": "0.3.0",
+  "description": "Runs expensive commands in parallel as far as the machine can take, so many coding agents on one machine cannot hang it.",
+  "type": "module",
+  "bin": {
+    "heavy": "bin/heavy"
+  },
+  "files": [
+    "bin/heavy"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/heavy.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robennals/agent-skills.git",
+    "directory": "plugins/heavy"
+  },
+  "homepage": "https://github.com/robennals/agent-skills/tree/main/plugins/heavy",
+  "keywords": [
+    "throttle",
+    "coding-agents",
+    "parallel",
+    "tests",
+    "memory-pressure"
+  ],
+  "author": "Rob Ennals",
+  "license": "MIT"
+}

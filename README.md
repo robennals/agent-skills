@@ -38,13 +38,8 @@ job has to wait, `heavy` says why and names the command, branch, session, and
 directory of what is running — so "no room" becomes "go ask the session on this
 branch".
 
-One step after installing, because a plugin cannot change your PATH:
-
-```
-/heavy:install
-```
-
-Details: [plugins/heavy](plugins/heavy).
+Nothing else to set up. Details, and how to use it from your terminal or other
+agents: [plugins/heavy](plugins/heavy).
 
 ## Working on these locally
 
@@ -88,6 +83,9 @@ claude plugin validate . --strict
 claude plugin validate plugins/heavy --strict
 cd plugins/heavy && node --test test/heavy.test.js
 ```
+
+The npm package `@robennals/heavy` is published from `plugins/heavy`. Keep the version
+in its `package.json` matching `plugin.json`; a test checks they agree.
 
 Note that `claude plugin marketplace add` needs `./` for a local path — a bare
 `.` is rejected.

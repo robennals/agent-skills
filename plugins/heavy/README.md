@@ -10,22 +10,22 @@ stops jobs if the machine gets overwhelmed.
 
 ## Install
 
+In Claude Code:
+
 ```
 /plugin marketplace add robennals/agent-skills
 /plugin install heavy@robennals-agent-skills
-/heavy:install
 ```
 
-The last step symlinks the wrapper into `~/.local/bin` (or `~/bin`), because a
-plugin cannot change your PATH. Until it runs, the guard hook stands down and
-nothing is throttled — installing this plugin never blocks a command before you
-have the wrapper that unblocks it.
+That's all: agents get the `heavy` command, a skill explaining it, and a guard that
+blocks unwrapped expensive commands. It needs node 20 or later. Without node, the
+guard stands down and you are told at session start, so your commands keep working.
 
-The symlink points into the installed plugin's version directory, which moves
-on every update. A `SessionStart` hook re-points it for you when that happens,
-so you never silently run the previous release. It only ever rewrites a symlink
-that already points into this plugin's cache — your own `heavy` on PATH is
-reported and left alone.
+- **For your own terminal:** run `/heavy:install` to link `heavy` into `~/.local/bin`
+  or `~/bin`. Agents don't need this. The link is re-pointed for you when the plugin
+  updates, and a `heavy` that isn't this plugin's link is left alone.
+- **For other coding agents:** `npm install -g @robennals/heavy` gives you the
+  command, without the guard. Tell those agents to use it in your `AGENTS.md`.
 
 ## Use
 
@@ -72,9 +72,6 @@ command it is.
 
 Developed and tested on macOS. Where memory can't be read, such as on Linux,
 `heavy` falls back to one job of each kind at a time.
-
-The guard hook only covers Claude Code. Agents on other harnesses get no
-enforcement, so state the rule in your `AGENTS.md` too if you run those.
 
 Internals, and how to widen or narrow what counts as expensive:
 [skills/heavy/references/internals.md](skills/heavy/references/internals.md).

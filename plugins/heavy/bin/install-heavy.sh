@@ -1,9 +1,8 @@
 #!/bin/sh
-# Put `heavy` on PATH by symlinking it from this plugin.
+# Add `heavy` to your terminal by symlinking it from this plugin.
 #
-# The plugin ships the wrapper but cannot change your PATH, and the guard hook
-# stays inert while `heavy` is missing — so until this runs, nothing is
-# throttled.
+# Agents in Claude Code don't need this: the plugin's bin/ is already on the Bash
+# tool's PATH. It is for running `heavy` yourself, or from other tools.
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -40,7 +39,7 @@ ln -sf "$wrapper" "$link"
 echo "linked $link -> $wrapper"
 
 if command -v heavy >/dev/null 2>&1; then
-  echo "heavy is on PATH. Expensive commands are now throttled machine-wide."
+  echo "heavy is on PATH."
 else
   echo "heavy is not on PATH yet in this shell; open a new one or fix PATH as above."
 fi

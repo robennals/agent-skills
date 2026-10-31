@@ -6,7 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -76,9 +76,7 @@ function askGuard(command, env = {}) {
   return execFileSync(process.execPath, [GUARD], {
     input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }),
     encoding: 'utf8',
-    // The guard allows everything when no wrapper is installed, so the deny
-    // cases need `heavy` reachable regardless of the caller's PATH.
-    env: { ...process.env, PATH: `${HERE}${path.delimiter}${process.env.PATH}`, ...env },
+    env: { ...process.env, ...env },
   })
 }
 
@@ -147,15 +145,61 @@ test('guard reads a heredoc body as data, not as commands', () => {
   assert.equal(guard("cat > f.sh <<'SH'\nhello\nSH\nnpm test"), 'run')
 })
 
-test('guard stands down when it cannot help', () => {
+test('guard can be turned off', () => {
   assert.equal(guard('npm test', { HEAVY_GUARD: '0' }), null)
-  // No wrapper on PATH: never wedge a machine that has nothing to wedge it with.
-  // (node is resolved by absolute path, so emptying PATH hides only heavy.)
-  assert.equal(execFileSync(process.execPath, [GUARD], {
+})
+
+test('guard works from a fresh install, with heavy on nobody\'s PATH', () => {
+  // Claude Code gives the Bash tool the plugin's bin/, but not the hook.
+  assert.equal(guard('npm test', { PATH: '/nonexistent' }), 'run')
+  const reason = JSON.parse(askGuard('npm test', { PATH: '/nonexistent' })).hookSpecificOutput.permissionDecisionReason
+  assert.ok(reason.includes(path.resolve(HEAVY)), 'the deny message gives the full path as a fallback')
+})
+
+test('with no node, the hook stands down quietly rather than failing every command', () => {
+  const hook = path.join(HERE, '..', 'hooks', 'run-guard.sh')
+  const emptyBin = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-test-'))
+  for (const tool of ['sh', 'dirname']) fs.symlinkSync(execFileSync('/bin/sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).trim(), path.join(emptyBin, tool))
+  const result = spawnSync('/bin/sh', [hook], {
     input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'npm test' } }),
     encoding: 'utf8',
-    env: { ...process.env, PATH: '/nonexistent' },
-  }).trim(), '')
+    env: { PATH: emptyBin },
+  })
+  assert.equal(result.status, 0)
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, '')
+})
+
+test('the hook passes the guard its input and its verdict', () => {
+  const hook = path.join(HERE, '..', 'hooks', 'run-guard.sh')
+  const out = execFileSync('/bin/sh', [hook], {
+    input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'npm test' } }),
+    encoding: 'utf8',
+  })
+  assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, 'deny')
+})
+
+test('session start repairs our own stale links and leaves everything else alone', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-test-'))
+  const root = path.join(HERE, '..')
+  const hook = path.join(root, 'hooks', 'ensure-path.sh')
+  fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true })
+  fs.mkdirSync(path.join(home, 'bin'))
+  // The old version is gone, so this link dangles.
+  const stale = path.join(home, '.local', 'bin', 'heavy')
+  fs.symlinkSync('/gone/plugins/cache/market/heavy/0.1.0/bin/heavy', stale)
+  const theirs = path.join(home, 'bin', 'heavy')
+  fs.symlinkSync('/opt/their/own/heavy', theirs)
+
+  const out = execFileSync('/bin/sh', [hook], { encoding: 'utf8', env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: root } })
+  assert.equal(fs.readlinkSync(stale), path.join(root, 'bin', 'heavy'))
+  assert.equal(fs.readlinkSync(theirs), '/opt/their/own/heavy')
+  assert.match(out, /re-pointed/)
+})
+
+test('every copy of the version number agrees', () => {
+  const read = (file) => JSON.parse(fs.readFileSync(path.join(HERE, '..', file), 'utf8')).version
+  assert.equal(read('package.json'), read('.claude-plugin/plugin.json'))
 })
 
 test('guard ignores tools other than Bash', () => {
