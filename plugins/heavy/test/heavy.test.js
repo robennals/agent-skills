@@ -336,6 +336,53 @@ test('a busy CPU does not hold back a server, but low memory does', async () => 
   await third
 })
 
+test('a pressure warning alone holds nothing back', async () => {
+  // macOS sits at warning for long stretches with plenty free and no swapping.
+  const machine = freshMachine()
+  machine.set({ pressure: 2, freePct: 42 })
+  const first = finished(machine.start('first', 'sleep 3'))
+  await until(() => machine.running().length === 1, 'the first job starting')
+  const second = finished(machine.start('second', 'sleep 3'))
+  await until(() => machine.running().length === 2, 'the second job starting at warning')
+  assert.equal(machine.state().verdict, 'calm')
+  await Promise.all([first, second])
+})
+
+test('sandboxed samples cannot hide critical pressure', async () => {
+  // A sandboxed wrapper reads no pressure level. Alternating with one that can must
+  // neither restart the overload clock nor let the verdict flip back to calm.
+  const machine = freshMachine()
+  const job = finished(machine.start('victim', 'sleep 8'))
+  await until(() => machine.running().length === 1, 'the job starting')
+  // Critical for 30ms in every 80. Samples come 60ms apart, so no two in a row can
+  // both read it, and only a remembered level can last the 120ms overload needs.
+  let finishedYet = false
+  const alternate = (async () => {
+    while (!finishedYet) {
+      machine.set({ pressure: 4 })
+      await sleep(30)
+      machine.set({ pressure: null })
+      await sleep(50)
+    }
+  })()
+  const stopped = await job
+  finishedYet = true
+  await alternate
+  assert.equal(stopped.code, 76)
+  assert.match(stopped.stderr, /memory pressure is critical/)
+})
+
+test('a critical reading is forgotten once nobody can confirm it', async () => {
+  const machine = freshMachine()
+  machine.set({ pressure: 4 })
+  execFileSync(process.execPath, [HEAVY, 'status'], { env: machine.env })
+  machine.set({ pressure: null })
+  await sleep(700) // past the 600ms a reading is kept
+  execFileSync(process.execPath, [HEAVY, 'status'], { env: machine.env })
+  assert.equal(machine.state().reading.pressure, null)
+  assert.equal(machine.state().verdict, 'calm')
+})
+
 test('one job always gets through a busy machine, so outside load cannot stop all work', async () => {
   const machine = freshMachine()
   machine.set({ cpu: 95, freePct: 25 })

@@ -59,11 +59,16 @@ a job that finishes sooner releases that wait at once, so short jobs flow freely
 | CPU in use | 70% | 98% for 2 minutes, with at least two jobs running |
 | Memory free, from `memory_pressure -Q` | 30% | 15% for 6s |
 | Swap traffic, from `vm_stat` | 20MB/s | 150MB/s for 6s |
-| Pressure level, from `sysctl`, only outside a sandbox | 2 | 4 for 6s |
+| Pressure level, from `sysctl`, only outside a sandbox | | 4 for 6s |
 | A simple query taking over 5s | | for 6s |
 
 `serve` jobs ignore the CPU column when deciding whether to start: servers mostly
 sit idle. Load average is deliberately not used.
+
+Pressure level 2, macOS's "warning", is ignored. macOS holds it for minutes at a
+time with 35-46% of memory free and no swap traffic, because it reflects how much
+memory is compressed rather than a real shortage. Free memory and swap traffic show
+that directly, and read the same inside and outside a sandbox.
 
 The thresholds are constants near the top of `bin/heavy`. They were set from one
 machine's normal readings (14 cores, 48GB: CPU 11-45%, 51-54% free, no swap

@@ -70,6 +70,8 @@ const STOP_GAP_MS = scaled(30_000)
 const STOP_GRACE_MS = scaled(5_000)
 const PROBE_TIMEOUT_MS = 5_000
 const INITIAL_LIMIT = 2
+// A sandboxed wrapper cannot read the pressure level, so it reuses a recent one.
+const PRESSURE_KEPT_MS = scaled(30_000)
 
 // Thresholds. Normal on the 14-core, 48GB machine this was tuned on: CPU 11-45%,
 // memory 51-54% free, swap traffic zero. Free percentage is what the kernel
@@ -80,7 +82,9 @@ const FREE_BUSY = 30
 const FREE_OVERLOADED = 15
 const SWAP_BUSY_MBPS = 20
 const SWAP_OVERLOADED_MBPS = 150
-const PRESSURE_WARNING = 2
+// The pressure level's "warning" is deliberately ignored: macOS holds it for long
+// stretches with 35-46% of memory free and no swapping, because it reflects how
+// much is compressed. Free memory and swap traffic show real shortage directly.
 const PRESSURE_CRITICAL = 4
 
 const STOPPED_EXIT_CODE = 76 // heavy stopped the job; distinct from 75, nothing ran
@@ -224,7 +228,6 @@ function assess({ cpu, freePct, swapMBps, pressure, stalled }) {
   const cpuOverloaded = []
   const cpuBusy = []
   if (pressure >= PRESSURE_CRITICAL) memoryOverloaded.push('memory pressure is critical')
-  else if (pressure >= PRESSURE_WARNING) memoryBusy.push('memory pressure is at warning')
   if (freePct !== null && freePct <= FREE_OVERLOADED) memoryOverloaded.push(`only ${freePct}% of memory is free`)
   else if (freePct !== null && freePct <= FREE_BUSY) memoryBusy.push(`only ${freePct}% of memory is free`)
   if (swapMBps >= SWAP_OVERLOADED_MBPS) memoryOverloaded.push(`swapping at ${swapMBps}MB/s`)
@@ -243,6 +246,7 @@ function initialState() {
     growMs: GROW_MS,
     raisedAt: 0,
     overloadAt: 0,
+    pressureAt: 0,
     memoryOverloadSince: null,
     cpuOverloadSince: null,
     stop: null,
@@ -276,7 +280,16 @@ function chooseJobToStop(jobs) {
   return newestFirst.find((job) => job.class === 'run') ?? newestFirst[0]
 }
 
-function decide(previous, reading, counters, jobs, waiting, now) {
+// Wrappers inside and outside a sandbox take turns measuring. Without this, every
+// sandboxed turn would look unpressured and restart the overload clock.
+function withRecentPressure(previous, measured, now) {
+  if (measured.pressure !== null) return measured
+  if (now - previous.pressureAt >= PRESSURE_KEPT_MS) return measured
+  return { ...measured, pressure: previous.reading?.pressure ?? null }
+}
+
+function decide(previous, measured, counters, jobs, waiting, now) {
+  const reading = withRecentPressure(previous, measured, now)
   const { memoryOverloaded, memoryBusy, cpuOverloaded, cpuBusy } = assess(reading)
   // CPU saturation only slows things down, and heavy never holds back the one job
   // left, so it counts only when stopping a job could actually make room.
@@ -288,6 +301,7 @@ function decide(previous, reading, counters, jobs, waiting, now) {
     at: now,
     reading,
     counters,
+    pressureAt: measured.pressure !== null ? now : previous.pressureAt,
     memoryOverloadSince: memoryOverloaded.length ? (continuing && previous.memoryOverloadSince) || now : null,
     cpuOverloadSince: cpuHot ? (continuing && previous.cpuOverloadSince) || now : null,
   }
