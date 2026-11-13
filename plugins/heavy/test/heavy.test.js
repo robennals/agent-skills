@@ -181,8 +181,11 @@ test('the hook passes the guard its input and its verdict', () => {
 
 test('session start repairs our own stale links and leaves everything else alone', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-test-'))
-  const root = path.join(HERE, '..')
-  const hook = path.join(root, 'hooks', 'ensure-path.sh')
+  // Shaped like an installed copy, since only those may take a link over.
+  const root = path.join(home, 'plugins', 'cache', 'market', 'heavy', '0.3.0')
+  fs.mkdirSync(root, { recursive: true })
+  fs.cpSync(path.join(HERE, '..', 'bin'), path.join(root, 'bin'), { recursive: true })
+  const hook = path.join(HERE, '..', 'hooks', 'ensure-path.sh')
   fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true })
   fs.mkdirSync(path.join(home, 'bin'))
   // The old version is gone, so this link dangles.
@@ -195,6 +198,18 @@ test('session start repairs our own stale links and leaves everything else alone
   assert.equal(fs.readlinkSync(stale), path.join(root, 'bin', 'heavy'))
   assert.equal(fs.readlinkSync(theirs), '/opt/their/own/heavy')
   assert.match(out, /re-pointed/)
+})
+
+test('a checkout loaded with --plugin-dir never takes over the terminal link', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-test-'))
+  fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true })
+  const link = path.join(home, '.local', 'bin', 'heavy')
+  const installed = '/x/plugins/cache/market/heavy/0.2.1/bin/heavy'
+  fs.symlinkSync(installed, link)
+  const root = path.join(HERE, '..') // a checkout, not a plugin cache
+  execFileSync('/bin/sh', [path.join(root, 'hooks', 'ensure-path.sh')],
+    { encoding: 'utf8', env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: root } })
+  assert.equal(fs.readlinkSync(link), installed)
 })
 
 test('every copy of the version number agrees', () => {

@@ -21,6 +21,13 @@ elif [ "$major" -lt 20 ]; then
   printf 'The heavy plugin needs node 20 or later and found node %s, so it will not work.\n' "$major"
 fi
 
+# Only an installed copy may take the link over. A session started with
+# --plugin-dir on a checkout would otherwise point your terminal at that checkout.
+case "$wrapper" in
+  */plugins/cache/*/heavy/*/bin/heavy) ;;
+  *) exit 0 ;;
+esac
+
 # Look where the installer links, rather than asking PATH: once the old version is
 # cleaned up the link dangles, and `command -v` can no longer see it.
 for link in "$HOME/.local/bin/heavy" "$HOME/bin/heavy"; do
