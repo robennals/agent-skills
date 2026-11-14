@@ -120,9 +120,8 @@ escape hatches, in order of preference:
 - `HEAVY_GUARD=0` in the environment — turns the hook off entirely. For a
   human's own terminal, not for agents.
 
-If `heavy` is not on PATH the hook allows everything, so a machine without the
-wrapper is never wedged by the guard. Run
-`bash "$CLAUDE_PLUGIN_ROOT/bin/install-heavy.sh"` to put it on PATH.
+If `heavy` isn't found, the message from the guard gives its full path. If node
+isn't available, the hook stands down and nothing is throttled.
 
 For exactly which commands are recognised, how the limit is learned, how it
 survives crashes, and how to widen or narrow the patterns, read

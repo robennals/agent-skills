@@ -1,43 +1,43 @@
 #!/bin/sh
-# Keep `heavy` on PATH pointing at the plugin copy that is actually installed.
+# Session-start checks. Claude Code puts this plugin's bin/ on the Bash tool's PATH
+# by itself, so a link is only needed for use outside it, and most people have none.
 #
-# The wrapper lives in a version-numbered directory, so a plugin update moves
-# it and leaves any symlink behind pointing at the old release. Nothing errors
-# when that happens — you just silently keep running the previous version. So
-# re-point the link here, once per session, when it has drifted.
+# Says something only when it needs to:
+# - heavy needs node 20 or later, and without it nothing is throttled.
+# - A link made by /heavy:install points into a version-numbered directory, so a
+#   plugin update leaves it on the previous release. Nothing errors when that
+#   happens, you just silently keep running old code, so re-point it here.
 #
-# This only ever rewrites a symlink that points into a plugin cache directory
-# for this plugin. A real file, or a symlink to anywhere else, is somebody
-# else's and is left alone with a message instead.
+# Only a symlink into this plugin's cache is ever rewritten. A real file, or a
+# symlink to anywhere else, is somebody else's and is left alone.
 
 wrapper="$CLAUDE_PLUGIN_ROOT/bin/heavy"
 [ -x "$wrapper" ] || exit 0
 
-current=$(command -v heavy 2>/dev/null)
-
-# Already correct: say nothing.
-if [ -n "$current" ] && [ "$(cd "$(dirname "$current")" && pwd -P)/$(basename "$current")" = "$wrapper" ]; then
-  exit 0
-fi
-if [ -n "$current" ] && [ -L "$current" ] && [ "$(readlink "$current")" = "$wrapper" ]; then
-  exit 0
+major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)
+if [ -z "$major" ]; then
+  printf 'The heavy plugin needs node, which is not on PATH, so nothing is being throttled.\n'
+elif [ "$major" -lt 20 ]; then
+  printf 'The heavy plugin needs node 20 or later and found node %s, so it will not work.\n' "$major"
 fi
 
-# On PATH but not ours. Only adopt a link we recognise as a stale copy of
-# this same plugin.
-if [ -n "$current" ]; then
-  target=$(readlink "$current" 2>/dev/null || echo '')
+# Only an installed copy may take the link over. A session started with
+# --plugin-dir on a checkout would otherwise point your terminal at that checkout.
+case "$wrapper" in
+  */plugins/cache/*/heavy/*/bin/heavy) ;;
+  *) exit 0 ;;
+esac
+
+# Look where the installer links, rather than asking PATH: once the old version is
+# cleaned up the link dangles, and `command -v` can no longer see it.
+for link in "$HOME/.local/bin/heavy" "$HOME/bin/heavy"; do
+  [ -L "$link" ] || continue
+  target=$(readlink "$link")
+  [ "$target" = "$wrapper" ] && continue
   case "$target" in
     */plugins/cache/*/heavy/*/bin/heavy)
-      ln -sf "$wrapper" "$current"
-      printf 'heavy: re-pointed %s at the installed version (%s)\n' "$current" "$wrapper"
-      ;;
-    *)
-      printf 'heavy: %s is on PATH but is not this plugin, so it is being left alone. The wrapper shipped here is %s\n' "$current" "$wrapper"
+      ln -sf "$wrapper" "$link"
+      printf 'heavy: re-pointed %s at the installed version (%s)\n' "$link" "$wrapper"
       ;;
   esac
-  exit 0
-fi
-
-# Not on PATH at all: the guard hook stands down, so nothing is throttled.
-printf 'The heavy plugin is installed but its wrapper is not on PATH yet, so nothing is throttled. Run: bash "%s/bin/install-heavy.sh"\n' "$CLAUDE_PLUGIN_ROOT"
+done

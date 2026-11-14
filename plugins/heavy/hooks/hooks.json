@@ -1,5 +1,5 @@
 {
-  "description": "heavy — denies expensive Bash commands that are not wrapped, and keeps the PATH symlink pointing at the installed version",
+  "description": "heavy — denies expensive Bash commands that are not wrapped, and keeps any terminal link pointing at the installed version",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/heavy-guard.js\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard.sh\"",
             "timeout": 10
           }
         ]
