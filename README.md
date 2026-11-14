@@ -84,8 +84,9 @@ claude plugin validate plugins/heavy --strict
 cd plugins/heavy && node --test test/heavy.test.js
 ```
 
-The npm package `@robennals/heavy` is published from `plugins/heavy`. Keep the version
-in its `package.json` matching `plugin.json`; a test checks they agree.
+`plugins/heavy/package.json` makes the command publishable to npm as
+`@robennals/heavy`; it isn't published yet. Keep its version matching `plugin.json`;
+a test checks they agree.
 
 Note that `claude plugin marketplace add` needs `./` for a local path — a bare
 `.` is rejected.

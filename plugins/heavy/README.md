@@ -24,8 +24,9 @@ guard stands down and you are told at session start, so your commands keep worki
 - **For your own terminal:** run `/heavy:install` to link `heavy` into `~/.local/bin`
   or `~/bin`. Agents don't need this. The link is re-pointed for you when the plugin
   updates, and a `heavy` that isn't this plugin's link is left alone.
-- **For other coding agents:** `npm install -g @robennals/heavy` gives you the
-  command, without the guard. Tell those agents to use it in your `AGENTS.md`.
+- **For other coding agents:** they need the command on PATH and an instruction in
+  your `AGENTS.md` to use it; only Claude Code gets the guard. Run `/heavy:install`
+  once from Claude Code, or link `plugins/heavy/bin/heavy` from a clone of this repo.
 
 ## Use
 
